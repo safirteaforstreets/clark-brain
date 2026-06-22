@@ -17,9 +17,11 @@
  *   - Optional: CLARK_MODEL (Claude paths, default claude-sonnet-4-6),
  *               CORS_ORIGIN (default https://report.teaforstreets.app; may be comma-separated)
  *   - Abuse guards: origin allow-list (CORS_ORIGIN), per-session turn cap
- *               (CLARK_MAX_TURNS=16) + best-effort per-IP throttle
- *               (CLARK_RL_PER_MIN=20, CLARK_RL_PER_DAY=300). Authoritative
- *               per-IP rate limiting belongs at the edge (APIM / Front Door).
+ *               (CLARK_MAX_TURNS=16), best-effort per-IP throttle
+ *               (CLARK_RL_PER_MIN=20, CLARK_RL_PER_DAY=300) + a global daily
+ *               call ceiling (CLARK_MAX_CALLS_PER_DAY=1500). Pair with a low
+ *               Function App max-instance count to bound worst-case burn;
+ *               an edge WAF (Front Door) is the upgrade for real traffic.
  *   - Cost control: Claude paths send the system prompt + corpus with prompt caching
  *     (~90% off repeat input); Azure OpenAI caches large prompts automatically.
  *
@@ -56,6 +58,7 @@ const ALLOWED_ORIGINS = CORS_ORIGIN.split(",").map(s => s.trim()).filter(Boolean
 const MAX_TURNS  = parseInt(process.env.CLARK_MAX_TURNS  || "16", 10);   // user messages per conversation
 const RL_PER_MIN = parseInt(process.env.CLARK_RL_PER_MIN || "20", 10);   // best-effort per-IP / minute (warm instance)
 const RL_PER_DAY = parseInt(process.env.CLARK_RL_PER_DAY || "300", 10);  // best-effort per-IP / day    (warm instance)
+const MAX_CALLS_DAY = parseInt(process.env.CLARK_MAX_CALLS_PER_DAY || "1500", 10); // global model-call ceiling / instance / day
 
 const _rl = new Map();   // ip -> { min:{t,c}, day:{t,c} } — per warm instance; resets on cold start
 function rateLimited(ip) {
@@ -68,6 +71,13 @@ function rateLimited(ip) {
   e.min.c++; e.day.c++;
   if (_rl.size > 5000) { for (const [k, v] of _rl) if (now - v.day.t > 86400000) _rl.delete(k); }
   return e.min.c > RL_PER_MIN || e.day.c > RL_PER_DAY;
+}
+let _glob = { t: Date.now(), c: 0 };       // global model-call counter (per warm instance; resets daily / on cold start)
+function dailyCeilingHit() {
+  const now = Date.now();
+  if (now - _glob.t > 86400000) { _glob.t = now; _glob.c = 0; }
+  _glob.c++;
+  return _glob.c > MAX_CALLS_DAY;
 }
 function originAllowed(origin) {
   return !origin || ALLOWED_ORIGINS.includes(origin);   // empty origin (non-browser) allowed; spoofable, so not the main guard
@@ -132,6 +142,11 @@ async function clarkBrain(body) {
   if (!message) return { ...FALLBACK, reply: "Tell me what's going on with your street and I'll take it from there." };
   const hasKey = USE_AOAI ? AOAI_KEY : API_KEY;
   if (!hasKey) return { ...FALLBACK, reply: "Clark AI isn't switched on yet — set AZURE_OPENAI_* (or ANTHROPIC_API_KEY) on the function." };
+  if (dailyCeilingHit()) {                   // global daily ceiling — caps spend even under distributed abuse
+    return { reply: "Clark's at capacity for today — you can still file directly at report.teaforstreets.app and it reaches the same team.",
+      category: "", jurisdiction: "", department: "", system: "", serviceName: "",
+      standards: [], severity: "normal", needsReview: false, ready: false, _blocked: "daily" };
+  }
 
   const messages = history
     .filter(m => m && (m.role === "user" || m.role === "assistant") && m.content)
@@ -213,4 +228,4 @@ try {
   });
 } catch (e) { /* not under the Azure Functions host; core is still exported below */ }
 
-module.exports = { clarkBrain, parseReply, rateLimited, originAllowed, corsHeaders };
+module.exports = { clarkBrain, parseReply, rateLimited, originAllowed, corsHeaders, dailyCeilingHit };
