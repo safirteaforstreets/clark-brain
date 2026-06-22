@@ -1,0 +1,8 @@
+{
+  "name": "clark-brain",
+  "version": "1.0.0",
+  "description": "Clark AI backend — Azure OpenAI (GPT) / Claude + Tea For Streets grounding. Azure Functions v4, Node 20+.",
+  "main": "clark-brain.js",
+  "engines": { "node": ">=20" },
+  "dependencies": { "@azure/functions": "^4.5.0" }
+}
