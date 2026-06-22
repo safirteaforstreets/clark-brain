@@ -15,7 +15,11 @@
  *        ANTHROPIC_FOUNDRY_RESOURCE (or _BASE_URL). Claude is NOT credit-covered.
  *   3) Direct Anthropic API — ANTHROPIC_API_KEY. Claude is NOT credit-covered.
  *   - Optional: CLARK_MODEL (Claude paths, default claude-sonnet-4-6),
- *               CORS_ORIGIN (default https://report.teaforstreets.app)
+ *               CORS_ORIGIN (default https://report.teaforstreets.app; may be comma-separated)
+ *   - Abuse guards: origin allow-list (CORS_ORIGIN), per-session turn cap
+ *               (CLARK_MAX_TURNS=16) + best-effort per-IP throttle
+ *               (CLARK_RL_PER_MIN=20, CLARK_RL_PER_DAY=300). Authoritative
+ *               per-IP rate limiting belongs at the edge (APIM / Front Door).
  *   - Cost control: Claude paths send the system prompt + corpus with prompt caching
  *     (~90% off repeat input); Azure OpenAI caches large prompts automatically.
  *
@@ -44,6 +48,39 @@ const AOAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT || "";
 const AOAI_DEPLOY = process.env.AZURE_OPENAI_DEPLOYMENT || "";
 const AOAI_VER = process.env.AZURE_OPENAI_API_VERSION || "2024-10-21";
 const USE_AOAI = !!(AOAI_KEY && AOAI_DEPLOY && (AOAI_RES || AOAI_ENDPOINT));
+
+/* ---- Abuse guardrails (cheap, defense-in-depth). The AUTHORITATIVE per-IP
+   limit belongs at the edge (API Management / Front Door); these cut casual
+   abuse and the Azure budget alert is the hard backstop. ---- */
+const ALLOWED_ORIGINS = CORS_ORIGIN.split(",").map(s => s.trim()).filter(Boolean);
+const MAX_TURNS  = parseInt(process.env.CLARK_MAX_TURNS  || "16", 10);   // user messages per conversation
+const RL_PER_MIN = parseInt(process.env.CLARK_RL_PER_MIN || "20", 10);   // best-effort per-IP / minute (warm instance)
+const RL_PER_DAY = parseInt(process.env.CLARK_RL_PER_DAY || "300", 10);  // best-effort per-IP / day    (warm instance)
+
+const _rl = new Map();   // ip -> { min:{t,c}, day:{t,c} } — per warm instance; resets on cold start
+function rateLimited(ip) {
+  if (!ip) return false;                          // no IP (server-to-server/health) — let through; edge + budget cover it
+  const now = Date.now();
+  let e = _rl.get(ip);
+  if (!e) { e = { min: { t: now, c: 0 }, day: { t: now, c: 0 } }; _rl.set(ip, e); }
+  if (now - e.min.t > 60000)    { e.min.t = now; e.min.c = 0; }
+  if (now - e.day.t > 86400000) { e.day.t = now; e.day.c = 0; }
+  e.min.c++; e.day.c++;
+  if (_rl.size > 5000) { for (const [k, v] of _rl) if (now - v.day.t > 86400000) _rl.delete(k); }
+  return e.min.c > RL_PER_MIN || e.day.c > RL_PER_DAY;
+}
+function originAllowed(origin) {
+  return !origin || ALLOWED_ORIGINS.includes(origin);   // empty origin (non-browser) allowed; spoofable, so not the main guard
+}
+function corsHeaders(origin) {
+  const allow = (origin && ALLOWED_ORIGINS.includes(origin)) ? origin : ALLOWED_ORIGINS[0];
+  return {
+    "Access-Control-Allow-Origin": allow,
+    "Vary": "Origin",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "content-type"
+  };
+}
 
 const SYSTEM = `You are Clark — "Clark the Cup," the Tea For Streets assistant. A resident tells you, in their own words, what's wrong on their street. Understand it, work out exactly who fixes it, ground it in the real city standard, get it onto the right desk, and make the person feel heard and confident it will move. Many have been frustrated for a long time; you are the outlet that finally does something.
 
@@ -85,6 +122,13 @@ async function clarkBrain(body) {
   const message = (body && body.message || "").toString().slice(0, 2000);
   if (message === "__warm__") return { reply: "", _warm: true };   // pre-warm ping — no model call
   const history = Array.isArray(body && body.history) ? body.history.slice(-12) : [];
+  const userTurns = Array.isArray(body && body.history)
+    ? body.history.filter(m => m && m.role === "user").length : 0;
+  if (userTurns >= MAX_TURNS) {                    // per-session cap — keeps one conversation from running forever
+    return { reply: "We've covered a lot in one go — let's get this one filed, or tap “Report another spot” to start fresh so I can keep it sharp.",
+      category: "", jurisdiction: "", department: "", system: "", serviceName: "",
+      standards: [], severity: "normal", needsReview: false, ready: false, _capped: true };
+  }
   if (!message) return { ...FALLBACK, reply: "Tell me what's going on with your street and I'll take it from there." };
   const hasKey = USE_AOAI ? AOAI_KEY : API_KEY;
   if (!hasKey) return { ...FALLBACK, reply: "Clark AI isn't switched on yet — set AZURE_OPENAI_* (or ANTHROPIC_API_KEY) on the function." };
@@ -140,18 +184,25 @@ async function clarkBrain(body) {
 }
 
 /* ---- Azure Functions v4 wrapper (guarded so the core stays importable anywhere) ---- */
-const cors = {
-  "Access-Control-Allow-Origin": CORS_ORIGIN,
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "content-type"
-};
 try {
   const { app } = require("@azure/functions");
   app.http("clark", {
     methods: ["POST", "OPTIONS"],
     authLevel: "anonymous",
     handler: async (request) => {
+      const origin = request.headers.get("origin") || "";
+      const cors = corsHeaders(origin);
       if (request.method === "OPTIONS") return { status: 204, headers: cors };
+      // Casual-abuse guards (real per-IP limit lives at the edge; budget alert is the backstop).
+      if (!originAllowed(origin)) {
+        return { status: 403, headers: { ...cors, "content-type": "application/json" },
+          jsonBody: { ...FALLBACK, reply: "This request isn't coming from Tea For Streets.", _blocked: "origin" } };
+      }
+      const ip = (request.headers.get("x-forwarded-for") || "").split(",")[0].trim();
+      if (rateLimited(ip)) {
+        return { status: 429, headers: { ...cors, "content-type": "application/json", "retry-after": "30" },
+          jsonBody: { ...FALLBACK, reply: "You're sending those faster than I can file them — give it a few seconds and try again.", _blocked: "rate" } };
+      }
       let body = {};
       try { body = await request.json(); } catch (e) {}
       let out;
@@ -162,4 +213,4 @@ try {
   });
 } catch (e) { /* not under the Azure Functions host; core is still exported below */ }
 
-module.exports = { clarkBrain, parseReply };
+module.exports = { clarkBrain, parseReply, rateLimited, originAllowed, corsHeaders };
