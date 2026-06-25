@@ -92,6 +92,50 @@ function corsHeaders(origin) {
   };
 }
 
+/* ---- Voice (Azure Speech TTS) — gives Clark's reply a warm spoken voice.
+   SPEECH_KEY / SPEECH_REGION live server-side only (never shipped to the app).
+   Returns a base64 mp3, or null on ANY miss → the app falls back to its local
+   voice and never goes mute. Stock lines are cached so repeats are instant + free.
+   Voice/style are env-overridable without a code change. ---- */
+const TTS_VOICE_EN = process.env.CLARK_TTS_VOICE_EN || "en-US-DavisNeural";
+const TTS_VOICE_ES = process.env.CLARK_TTS_VOICE_ES || "es-MX-JorgeNeural";
+const TTS_STYLE_EN = process.env.CLARK_TTS_STYLE_EN || "hopeful";
+const _ttsCache = new Map();   // voice|text -> base64 mp3 (per warm instance)
+function _xml(s) {
+  return String(s).replace(/[<>&'"]/g, c =>
+    ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", "'": "&apos;", '"': "&quot;" }[c]));
+}
+async function synthesize(text, lang) {
+  const region = process.env.SPEECH_REGION, key = process.env.SPEECH_KEY;
+  if (!region || !key || !text) return null;            // no creds / nothing to say
+  const es = lang === "es";
+  const voice = es ? TTS_VOICE_ES : TTS_VOICE_EN;
+  const ck = voice + "|" + text;
+  if (_ttsCache.has(ck)) return _ttsCache.get(ck);      // cache hit = instant, $0
+  const inner = (es || !TTS_STYLE_EN)
+    ? _xml(text)
+    : '<mstts:express-as style="' + TTS_STYLE_EN + '">' + _xml(text) + "</mstts:express-as>";
+  const ssml = '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
+    + 'xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="' + (es ? "es-MX" : "en-US") + '">'
+    + '<voice name="' + voice + '">' + inner + "</voice></speak>";
+  try {
+    const r = await fetch("https://" + region + ".tts.speech.microsoft.com/cognitiveservices/v1", {
+      method: "POST",
+      headers: {
+        "Ocp-Apim-Subscription-Key": key,
+        "Content-Type": "application/ssml+xml",
+        "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
+        "User-Agent": "clark-brain"
+      },
+      body: ssml
+    });
+    if (!r.ok) return null;
+    const b64 = Buffer.from(await r.arrayBuffer()).toString("base64");
+    if (text.length < 160) _ttsCache.set(ck, b64);       // cache short / stock lines
+    return b64;
+  } catch (e) { return null; }
+}
+
 const SYSTEM = `You are Clark — "Clark the Cup," the Tea For Streets assistant. A resident tells you, in their own words, what's wrong on their street. Understand it, work out exactly who fixes it, ground it in the real city standard, get it onto the right desk, and make the person feel heard and confident it will move. Many have been frustrated for a long time; you are the outlet that finally does something.
 
 VOICE: Warm but brief — this is mobile. Default to ONE sentence; a second only if truly needed. Cut filler and hedging; don't restate their words back at length. PLAIN LANGUAGE ONLY — a child or grandparent should understand every word; in what the resident hears, NEVER name a department, "311", or a standard/code. Where a report goes is simply "the City of <city>" (or "LA County"). If there's real feeling, acknowledge it in a few words, then act. One sharp clarifier at a time. Confident about what happens next.
@@ -223,9 +267,18 @@ try {
       let out;
       try { out = await clarkBrain(body); }
       catch (e) { out = { ...FALLBACK, _error: String(e && e.message || e) }; }
+      // Voice: only when the client opts in with tts:true (the native app), so the
+      // web pages that use their own browser voice don't spend TTS characters.
+      if (body && body.tts) {
+        try {
+          const lang = (body.lang === "es") ? "es" : "en";
+          out.audio = await synthesize(out.reply, lang);   // base64 mp3, or null
+          out.audioFormat = "mp3";
+        } catch (e) { out.audio = null; }
+      }
       return { status: 200, headers: { ...cors, "content-type": "application/json" }, jsonBody: out };
     }
   });
 } catch (e) { /* not under the Azure Functions host; core is still exported below */ }
 
-module.exports = { clarkBrain, parseReply, rateLimited, originAllowed, corsHeaders, dailyCeilingHit };
+module.exports = { clarkBrain, synthesize, parseReply, rateLimited, originAllowed, corsHeaders, dailyCeilingHit };
